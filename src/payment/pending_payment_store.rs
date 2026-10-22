@@ -890,4 +890,151 @@ mod tests {
 			assert!(read.is_err(), "{:02x?} must not read", bytes);
 		}
 	}
+
+	/// The legacy reader's edges: layout detection, a crafted hybrid, the sparse `Writeable`, and
+	/// the key a converted entry keeps.
+	mod legacy_reader_edges {
+		use super::*;
+		use lightning::util::ser::BigSize;
+
+		/// The (type, length) of the first TLV record of a length-prefixed stream.
+		fn first_record(bytes: &[u8]) -> (u64, u64) {
+			let mut r = &bytes[..];
+			let _len: BigSize = Readable::read(&mut r).unwrap();
+			let t: BigSize = Readable::read(&mut r).unwrap();
+			let l: BigSize = Readable::read(&mut r).unwrap();
+			(t.0, l.0)
+		}
+
+		/// The records of a length-prefixed stream, after its `BigSize` prefix.
+		fn records(bytes: &[u8]) -> &[u8] {
+			let mut r = &bytes[..];
+			let len: BigSize = Readable::read(&mut r).unwrap();
+			&bytes[len.encode().len()..]
+		}
+
+		fn minimal_details(id: PaymentId) -> PaymentDetails {
+			PaymentDetails::new(
+				id,
+				PaymentKind::Onchain {
+					txid: Txid::from_byte_array(id.0),
+					status: ConfirmationStatus::Unconfirmed,
+					tx_type: None,
+				},
+				None,
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			)
+		}
+
+		/// The layout detection cannot misfire on a well-formed legacy entry: the smallest
+		/// `PaymentDetails` encodes to more than 32 bytes, so a legacy type-0 record is never 32
+		/// bytes long; every lab-pin entry opens with (0, 122).
+		#[test]
+		fn legacy_first_record_is_always_longer_than_32_bytes() {
+			let id = PaymentId([0x11; 32]);
+			let details = minimal_details(id);
+			let details_len = details.encode().len();
+			assert!(details_len > 32, "minimal PaymentDetails is {details_len} bytes");
+			let legacy = LegacyPendingPaymentDetails {
+				details,
+				conflicting_txids: Vec::new(),
+				candidates: Vec::new(),
+			};
+			let bytes = legacy.encode();
+			assert_eq!(first_record(&bytes), (0, details_len as u64));
+			assert!(!starts_with_payment_id(records(&bytes)));
+			let entry: PendingPaymentDetails = Readable::read(&mut &bytes[..]).unwrap();
+			assert_eq!(entry.id, id);
+			assert_eq!(first_record(&entry.encode()), (0, 32));
+			assert!(starts_with_payment_id(records(&entry.encode())));
+			for (_, _, stored) in LAB_PIN_ENTRIES {
+				let bytes = decode_hex(stored);
+				assert_eq!(first_record(&bytes), (0, 122));
+				assert!(!starts_with_payment_id(records(&bytes)));
+			}
+		}
+
+		/// A crafted stream opening with a 32-byte type-0 record over a legacy tail (type 2
+		/// raw txids, type 4 legacy candidates) must fail, never decode as an id-keyed entry with
+		/// the crafted id and reinterpreted fields.
+		#[test]
+		fn crafted_id_keyed_prefix_over_a_legacy_tail_fails_to_read() {
+			let legacy = LegacyPendingPaymentDetails {
+				details: minimal_details(PaymentId([0x22; 32])),
+				conflicting_txids: vec![test_txid(8), test_txid(9)],
+				candidates: vec![LegacyFundingTxCandidate {
+					txid: test_txid(7),
+					amount_msat: Some(1),
+					fee_paid_msat: None,
+				}],
+			};
+			let bytes = legacy.encode();
+			let recs = records(&bytes);
+			assert_eq!(recs[0], 0);
+			let l = recs[1] as usize;
+			assert!((32..253).contains(&l));
+			let tail = &recs[2 + l..];
+			assert!(!tail.is_empty(), "the legacy tail holds types 2 and 4");
+			let mut crafted_records = vec![0u8, 32];
+			crafted_records.extend_from_slice(&[0x5a; 32]);
+			crafted_records.extend_from_slice(tail);
+			let mut crafted = BigSize(crafted_records.len() as u64).encode();
+			crafted.extend_from_slice(&crafted_records);
+			assert!(starts_with_payment_id(&crafted_records));
+			let read: Result<PendingPaymentDetails, DecodeError> =
+				Readable::read(&mut &crafted[..]);
+			match read {
+				Err(_) => {},
+				Ok(e) => panic!(
+					"crafted hybrid decoded silently: id={:?} details={} conflicts={:?} candidates={:?}",
+					e.id,
+					e.details.is_some(),
+					e.conflicting_txids,
+					e.candidates
+				),
+			}
+		}
+
+		/// The hand-written `Writeable` agrees with the generated one on the sparse case
+		/// (details None, every optional_vec empty): only the id record is written, and it reads
+		/// back as the id-keyed layout.
+		#[test]
+		fn writeable_omits_empty_vecs_and_none_details_like_the_macro() {
+			let entry = PendingPaymentDetails {
+				id: PaymentId([3; 32]),
+				details: None,
+				conflicting_txids: Vec::new(),
+				funding_channels: Vec::new(),
+				candidates: Vec::new(),
+				locked_rounds: Vec::new(),
+			};
+			let bytes = entry.encode();
+			assert_eq!(bytes, GeneratedLayout::from(&entry).encode());
+			assert_eq!(bytes.len(), 1 + 2 + 32);
+			assert_eq!(first_record(&bytes), (0, 32));
+			let back: PendingPaymentDetails = Readable::read(&mut &bytes[..]).unwrap();
+			assert_eq!(back, entry);
+			assert_eq!(entry.serialized_length(), bytes.len());
+		}
+
+		/// A converted lab entry is keyed by its payment's id, i.e. the KV key the legacy
+		/// store used, so its next write lands on the same key (no orphan, no duplicate), and it
+		/// is not `is_empty()` (it would otherwise be dropped as tracking nothing).
+		#[test]
+		fn converted_lab_entry_keeps_its_legacy_key_and_is_not_empty() {
+			for (key, _, stored) in LAB_PIN_ENTRIES {
+				let entry: PendingPaymentDetails =
+					Readable::read(&mut &decode_hex(stored)[..]).unwrap();
+				assert_eq!(crate::hex_utils::to_string(&entry.id().0), key);
+				assert!(!entry.is_empty());
+				assert_eq!(first_record(&entry.encode()), (0, 32));
+				// Nothing a splice consumer acts on: no candidate awaits broadcast, no channel
+				// is tracked, so the restart sweeps skip it.
+				assert!(entry.candidates().iter().all(|c| !c.awaiting_broadcast));
+				assert!(entry.funding_channels().is_empty());
+			}
+		}
+	}
 }
