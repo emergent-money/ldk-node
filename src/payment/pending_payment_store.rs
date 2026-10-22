@@ -6,8 +6,11 @@
 // accordance with one or both of these licenses.
 
 use bitcoin::Txid;
-use lightning::impl_writeable_tlv_based;
+use lightning::io::Read;
 use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::msgs::DecodeError;
+use lightning::util::ser::{BigSize, Readable, Writeable, Writer};
+use lightning::{_decode_and_build, impl_writeable_tlv_based, write_tlv_fields};
 
 use crate::data_store::{StorableObject, StorableObjectUpdate, UpdatableObject};
 use crate::payment::store::{Channel, PaymentDetailsUpdate, TransactionType};
@@ -168,14 +171,109 @@ impl PendingPaymentDetails {
 	}
 }
 
-impl_writeable_tlv_based!(PendingPaymentDetails, {
-	(0, id, required),
-	(2, details, option),
-	(4, conflicting_txids, optional_vec),
-	(6, funding_channels, optional_vec),
-	(8, candidates, optional_vec),
-	(12, locked_rounds, optional_vec),
+impl Writeable for PendingPaymentDetails {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
+		// The layout `impl_writeable_tlv_based!` generated, unchanged. It is spelled out only because
+		// the macro would also generate a `Readable`, and the one below reads the legacy layout too.
+		write_tlv_fields!(writer, {
+			(0, self.id, required),
+			(2, self.details, option),
+			(4, self.conflicting_txids, optional_vec),
+			(6, self.funding_channels, optional_vec),
+			(8, self.candidates, optional_vec),
+			(12, self.locked_rounds, optional_vec),
+		});
+		Ok(())
+	}
+}
+
+impl Readable for PendingPaymentDetails {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		// Both layouts are a length-prefixed TLV stream: a `BigSize` length, then that many bytes of
+		// TLV records. Buffer the stream, so that its first record can tell the layout before either
+		// decodes it.
+		let len: BigSize = Readable::read(reader)?;
+		let mut stream = len.encode();
+		let records_start = stream.len();
+		let records_read = reader.read_to_limit(&mut stream, len.0)?;
+		if records_read as u64 != len.0 {
+			return Err(DecodeError::ShortRead);
+		}
+
+		let reader = &mut &stream[..];
+		if starts_with_payment_id(&stream[records_start..]) {
+			Ok(_decode_and_build!(reader, Self, {
+				(0, id, required),
+				(2, details, option),
+				(4, conflicting_txids, optional_vec),
+				(6, funding_channels, optional_vec),
+				(8, candidates, optional_vec),
+				(12, locked_rounds, optional_vec),
+			}))
+		} else {
+			// Not the id-keyed layout, so the legacy one or nothing: an entry whose payment record
+			// fails to decode fails the read rather than being dropped.
+			let legacy: LegacyPendingPaymentDetails = Readable::read(reader)?;
+			Ok(legacy.into())
+		}
+	}
+}
+
+/// Whether the given TLV records open with a 32-byte record of type 0, as an entry in the id-keyed
+/// layout does with its [`PaymentId`]. An entry in the legacy layout opens with type 0 too, but
+/// holding its length-prefixed [`PaymentDetails`], whose own id record alone takes 34 bytes.
+fn starts_with_payment_id(mut records: &[u8]) -> bool {
+	let first_type: Result<BigSize, DecodeError> = Readable::read(&mut records);
+	let first_len: Result<BigSize, DecodeError> = Readable::read(&mut records);
+	matches!((first_type, first_len), (Ok(BigSize(0)), Ok(BigSize(32))))
+}
+
+/// A [`FundingTxCandidate`] as an entry in the legacy layout recorded it: once the round was
+/// broadcast, so never awaiting broadcast.
+struct LegacyFundingTxCandidate {
+	txid: Txid,
+	amount_msat: Option<u64>,
+	fee_paid_msat: Option<u64>,
+}
+
+impl_writeable_tlv_based!(LegacyFundingTxCandidate, {
+	(0, txid, required),
+	(2, amount_msat, option),
+	(4, fee_paid_msat, option),
 });
+
+impl From<LegacyFundingTxCandidate> for FundingTxCandidate {
+	fn from(legacy: LegacyFundingTxCandidate) -> Self {
+		let LegacyFundingTxCandidate { txid, amount_msat, fee_paid_msat } = legacy;
+		Self { txid, amount_msat, fee_paid_msat, awaiting_broadcast: false }
+	}
+}
+
+/// A [`PendingPaymentDetails`] in the layout written before entries were keyed by their own id and
+/// before signing a round recorded it (LDK Node 0cea341 and earlier; no release shipped it). Every
+/// entry then held its payment record, under type 0, and was keyed by that payment's id.
+struct LegacyPendingPaymentDetails {
+	details: PaymentDetails,
+	conflicting_txids: Vec<Txid>,
+	candidates: Vec<LegacyFundingTxCandidate>,
+}
+
+impl_writeable_tlv_based!(LegacyPendingPaymentDetails, {
+	(0, details, required),
+	(2, conflicting_txids, optional_vec),
+	(4, candidates, optional_vec),
+});
+
+impl From<LegacyPendingPaymentDetails> for PendingPaymentDetails {
+	/// Keys the entry by its payment's id. It recorded no channels for its rounds, whose payment's
+	/// classification lists them, and no rounds LDK promoted. It is rewritten in the id-keyed
+	/// layout on its next update.
+	fn from(legacy: LegacyPendingPaymentDetails) -> Self {
+		let LegacyPendingPaymentDetails { details, conflicting_txids, candidates } = legacy;
+		let candidates = candidates.into_iter().map(FundingTxCandidate::from).collect();
+		Self::new(details, conflicting_txids, candidates)
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingPaymentDetailsUpdate {
@@ -518,5 +616,278 @@ mod tests {
 		assert!(stored.update(synced.to_update()));
 		assert_eq!(stored.candidates().len(), 2);
 		assert_eq!(stored.locked_rounds(), &[test_txid(2)]);
+	}
+
+	/// Entries a node on LDK Node 0cea341 wrote in the legacy layout, each as the key it is stored
+	/// under (its payment's id, in hex), the amount its payment record holds in millisatoshis, and
+	/// the entry as stored. Each records an outbound on-chain payment whose transaction (the id)
+	/// was unconfirmed when written, with no classification, a zero fee and no conflicts or
+	/// candidates.
+	const LAB_PIN_ENTRIES: [(&str, u64, &str); 5] = [
+		(
+			"193a3693fcb69421843acace003b9159ad0ca7a8ea684a7d4767d67786649f3c",
+			351_000,
+			"7c007a790020193a3693fcb69421843acace003b9159ad0ca7a8ea684a7d4767d67786649f3c020100032800260020193a3693fcb69421843acace003b9159ad0ca7a8ea684a7d4767d67786649f3c020202000401000508000000006aa9df930609090000000000055b1807080000000000000000080201000a020000",
+		),
+		(
+			"369c067a29823bf20fdac1b967cb90810692f5085727cfd55db2d9781bf4612f",
+			349_000,
+			"7c007a790020369c067a29823bf20fdac1b967cb90810692f5085727cfd55db2d9781bf4612f020100032800260020369c067a29823bf20fdac1b967cb90810692f5085727cfd55db2d9781bf4612f020202000401000508000000006a848b70060909000000000005534807080000000000000000080201000a020000",
+		),
+		(
+			"5bf11b02ace6c60a26c36713d41e6f251c0af64882d6afedbce69533d51c1f74",
+			849_000,
+			"7c007a7900205bf11b02ace6c60a26c36713d41e6f251c0af64882d6afedbce69533d51c1f740201000328002600205bf11b02ace6c60a26c36713d41e6f251c0af64882d6afedbce69533d51c1f74020202000401000508000000006a84870f06090900000000000cf46807080000000000000000080201000a020000",
+		),
+		(
+			"e7b5041b402d3a1fa7624caab309cf77daac826356116116d6dbb180c54611a9",
+			349_000,
+			"7c007a790020e7b5041b402d3a1fa7624caab309cf77daac826356116116d6dbb180c54611a9020100032800260020e7b5041b402d3a1fa7624caab309cf77daac826356116116d6dbb180c54611a9020202000401000508000000006a848b70060909000000000005534807080000000000000000080201000a020000",
+		),
+		(
+			"eac9392cc0227ce77338744b6d173195e54ad67209d93c54ae2463866811fb41",
+			351_000,
+			"7c007a790020eac9392cc0227ce77338744b6d173195e54ad67209d93c54ae2463866811fb41020100032800260020eac9392cc0227ce77338744b6d173195e54ad67209d93c54ae2463866811fb41020202000401000508000000006aa9df930609090000000000055b1807080000000000000000080201000a020000",
+		),
+	];
+
+	fn decode_hex(hex: &str) -> Vec<u8> {
+		crate::hex_utils::to_vec(hex).expect("test hex must be valid")
+	}
+
+	#[test]
+	fn reads_legacy_pending_payment_records_from_the_lab_pin() {
+		for (key, amount_msat, stored) in LAB_PIN_ENTRIES {
+			let id = PaymentId(decode_hex(key).try_into().expect("a payment id is 32 bytes"));
+			let entry: PendingPaymentDetails = Readable::read(&mut &decode_hex(stored)[..])
+				.unwrap_or_else(|e| panic!("entry {} must read: {}", key, e));
+
+			assert_eq!(entry.id, id);
+			let details = entry.details().expect("a legacy entry always held its payment record");
+			assert_eq!(details.id, id);
+			assert!(entry.conflicting_txids().is_empty());
+			assert!(entry.funding_channels.is_empty());
+			assert!(entry.candidates().is_empty());
+			assert!(entry.locked_rounds().is_empty());
+
+			// What each of these entries holds: an outbound on-chain send of `amount_msat` with a
+			// zero fee, pending on its unconfirmed transaction, whose txid is the payment id.
+			assert_eq!(
+				details.kind,
+				PaymentKind::Onchain {
+					txid: Txid::from_byte_array(id.0),
+					status: ConfirmationStatus::Unconfirmed,
+					tx_type: None,
+				}
+			);
+			assert_eq!(details.status, PaymentStatus::Pending);
+			assert_eq!(details.direction, PaymentDirection::Outbound);
+			assert_eq!(details.amount_msat, Some(amount_msat));
+			assert_eq!(details.fee_paid_msat, Some(0));
+
+			// The next write of the entry moves it to the id-keyed layout, unchanged.
+			let rewritten = entry.encode();
+			assert_eq!(rewritten, GeneratedLayout::from(&entry).encode());
+			let reread: PendingPaymentDetails =
+				Readable::read(&mut &rewritten[..]).expect("a rewritten entry reads");
+			assert_eq!(reread, entry);
+		}
+	}
+
+	fn test_channel() -> Channel {
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32])
+			.expect("test secret key must be valid");
+		Channel {
+			counterparty_node_id: bitcoin::secp256k1::PublicKey::from_secret_key(
+				&secp,
+				&secret_key,
+			),
+			channel_id: lightning::ln::types::ChannelId::from_bytes([4u8; 32]),
+		}
+	}
+
+	#[test]
+	fn reads_legacy_record_with_conflicts_and_candidates() {
+		// A splice joined via RBF, as the legacy layout recorded it at its second round's
+		// broadcast: the payment keyed by the first round, a counterparty-initiated round we did
+		// not contribute to, then our own.
+		let first_txid = test_txid(5);
+		let rbf_txid = test_txid(6);
+		let payment_id = PaymentId(first_txid.to_byte_array());
+		let details = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Onchain {
+				txid: rbf_txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: Some(TransactionType::InteractiveFunding {
+					channels: vec![test_channel()],
+				}),
+			},
+			Some(1_000_000),
+			Some(5_000),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		let legacy = LegacyPendingPaymentDetails {
+			details: details.clone(),
+			conflicting_txids: vec![test_txid(8), test_txid(9)],
+			candidates: vec![
+				LegacyFundingTxCandidate {
+					txid: first_txid,
+					amount_msat: None,
+					fee_paid_msat: None,
+				},
+				LegacyFundingTxCandidate {
+					txid: rbf_txid,
+					amount_msat: Some(1_000_000),
+					fee_paid_msat: Some(5_000),
+				},
+			],
+		};
+
+		let entry: PendingPaymentDetails =
+			Readable::read(&mut &legacy.encode()[..]).expect("a legacy entry reads");
+
+		assert_eq!(
+			entry,
+			PendingPaymentDetails {
+				id: payment_id,
+				details: Some(details),
+				conflicting_txids: vec![test_txid(8), test_txid(9)],
+				funding_channels: Vec::new(),
+				candidates: vec![
+					FundingTxCandidate {
+						txid: first_txid,
+						amount_msat: None,
+						fee_paid_msat: None,
+						awaiting_broadcast: false,
+					},
+					FundingTxCandidate {
+						txid: rbf_txid,
+						amount_msat: Some(1_000_000),
+						fee_paid_msat: Some(5_000),
+						awaiting_broadcast: false,
+					},
+				],
+				locked_rounds: Vec::new(),
+			}
+		);
+		// With none recorded on the entry, its channels come from its payment's classification.
+		assert_eq!(entry.funding_channels(), &[test_channel()]);
+	}
+
+	/// `PendingPaymentDetails` as `impl_writeable_tlv_based!` serialized it before the legacy
+	/// layout needed reading, to hold the hand-written `Writeable` to it byte for byte.
+	#[derive(Debug, PartialEq, Eq)]
+	struct GeneratedLayout {
+		id: PaymentId,
+		details: Option<PaymentDetails>,
+		conflicting_txids: Vec<Txid>,
+		funding_channels: Vec<Channel>,
+		candidates: Vec<FundingTxCandidate>,
+		locked_rounds: Vec<Txid>,
+	}
+
+	impl_writeable_tlv_based!(GeneratedLayout, {
+		(0, id, required),
+		(2, details, option),
+		(4, conflicting_txids, optional_vec),
+		(6, funding_channels, optional_vec),
+		(8, candidates, optional_vec),
+		(12, locked_rounds, optional_vec),
+	});
+
+	impl From<&PendingPaymentDetails> for GeneratedLayout {
+		fn from(entry: &PendingPaymentDetails) -> Self {
+			Self {
+				id: entry.id,
+				details: entry.details.clone(),
+				conflicting_txids: entry.conflicting_txids.clone(),
+				funding_channels: entry.funding_channels.clone(),
+				candidates: entry.candidates.clone(),
+				locked_rounds: entry.locked_rounds.clone(),
+			}
+		}
+	}
+
+	#[test]
+	fn round_trips_new_layout_unchanged() {
+		let first_txid = test_txid(5);
+		let rbf_txid = test_txid(6);
+		let payment_id = PaymentId(first_txid.to_byte_array());
+		let signed_rbf_round = FundingTxCandidate {
+			txid: rbf_txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(5_000),
+			awaiting_broadcast: true,
+		};
+		// A splice whose first round LDK promoted, with an RBF round signed but not yet broadcast,
+		// and the same before wallet sync observed any transaction of it.
+		let observed = PendingPaymentDetails {
+			id: payment_id,
+			details: Some(pending_onchain_payment(payment_id, first_txid)),
+			conflicting_txids: vec![test_txid(9)],
+			funding_channels: vec![test_channel()],
+			candidates: vec![
+				FundingTxCandidate {
+					txid: first_txid,
+					amount_msat: Some(1_000_000),
+					fee_paid_msat: Some(1_000),
+					awaiting_broadcast: false,
+				},
+				signed_rbf_round.clone(),
+			],
+			locked_rounds: vec![first_txid],
+		};
+		let signed = PendingPaymentDetails::signed_rounds(
+			payment_id,
+			vec![test_channel()],
+			vec![signed_rbf_round],
+		);
+
+		for stored in [observed, signed] {
+			let written = stored.encode();
+			let generated = GeneratedLayout::from(&stored);
+			assert_eq!(written, generated.encode());
+			assert_eq!(stored.serialized_length(), generated.serialized_length());
+			assert_eq!(
+				GeneratedLayout::read(&mut &written[..]).expect("the generated reader reads it"),
+				generated
+			);
+
+			let decoded: PendingPaymentDetails =
+				Readable::read(&mut &written[..]).expect("an id-keyed entry reads");
+			assert_eq!(decoded, stored);
+		}
+	}
+
+	#[test]
+	fn rejects_garbage() {
+		let lab_entry = decode_hex(LAB_PIN_ENTRIES[0].2);
+		let mut id_keyed_then_junk = vec![37, 0, 32];
+		id_keyed_then_junk.extend_from_slice(&[1u8; 32]);
+		id_keyed_then_junk.extend_from_slice(&[2, 1, 0xff]);
+		let garbage: [&[u8]; 8] = [
+			// Nothing at all.
+			&[],
+			// Nonsense: a record of type 0xde claiming more bytes than the stream holds.
+			&[4, 0xde, 0xad, 0xbe, 0xef],
+			b"Nonsense bytes",
+			// A stream claiming `u64::MAX` bytes.
+			&[0xff; 9],
+			// A lab entry missing its last byte.
+			&lab_entry[..lab_entry.len() - 1],
+			// A legacy entry whose payment record is an empty TLV stream, missing its id.
+			&[3, 0, 1, 0],
+			// A legacy entry whose payment record is junk.
+			&[5, 0, 3, 0xff, 0xff, 0xff],
+			// An id-keyed entry whose payment record is junk.
+			&id_keyed_then_junk[..],
+		];
+		for bytes in garbage {
+			let read: Result<PendingPaymentDetails, DecodeError> = Readable::read(&mut &bytes[..]);
+			assert!(read.is_err(), "{:02x?} must not read", bytes);
+		}
 	}
 }
