@@ -2249,6 +2249,8 @@ where
 					None
 				};
 
+				self.liquidity_source.lsps2_service().handle_channel_closed(channel_id).await;
+
 				let event = Event::ChannelClosed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
