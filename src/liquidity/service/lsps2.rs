@@ -75,6 +75,18 @@ pub struct LSPS2ServiceConfig {
 	/// larger than then the to-be-forwarded amount (i.e., client-requested amount minus the
 	/// channel opening fee fee).
 	pub channel_over_provisioning_ppm: u32,
+	/// The minimum over-provisioning for the channel, in millisatoshis.
+	///
+	/// The channel we open is sized to the to-be-forwarded amount plus the LARGER of the
+	/// proportional over-provisioning ([`channel_over_provisioning_ppm`]) and this floor, so a
+	/// client's first channel keeps at least this much inbound capacity (before any channel
+	/// reserve) whatever the size of the payment that opened it. With the proportional sizing
+	/// alone, a wallet that must keep a channel's inbound above a fixed threshold before it can
+	/// move funds into it (e.g. a trusted-tier sweep) never gets there from a mid-sized first
+	/// payment. Set to `0` to keep the proportional sizing alone.
+	///
+	/// [`channel_over_provisioning_ppm`]: Self::channel_over_provisioning_ppm
+	pub min_channel_over_provisioning_msat: u64,
 	/// The minimum fee required for opening a channel.
 	pub min_channel_opening_fee_msat: u64,
 	/// The minimum number of blocks after confirmation we promise to keep the channel open.
@@ -445,10 +457,11 @@ where
 				};
 
 				// Fail if we have insufficient onchain funds available.
-				let over_provisioning_msat = (amt_to_forward_msat
-					* service_config.channel_over_provisioning_ppm as u64)
-					/ 1_000_000;
-				let channel_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
+				let channel_amount_sats = jit_channel_amount_sats(
+					amt_to_forward_msat,
+					service_config.channel_over_provisioning_ppm,
+					service_config.min_channel_over_provisioning_msat,
+				);
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let spendable_amount_sats =
@@ -534,3 +547,53 @@ where
 		}
 	}
 }
+
+/// The capacity of the JIT channel opened for a payment of `amt_to_forward_msat`: the amount
+/// plus the larger of the proportional over-provisioning (`over_provisioning_ppm`) and the
+/// configured floor (`min_channel_over_provisioning_msat`), in satoshis, rounded down.
+/// Saturating, so no amount can wrap the size.
+pub(crate) fn jit_channel_amount_sats(
+	amt_to_forward_msat: u64, over_provisioning_ppm: u32, min_channel_over_provisioning_msat: u64,
+) -> u64 {
+	let proportional_msat = u128::from(amt_to_forward_msat) * u128::from(over_provisioning_ppm)
+		/ 1_000_000;
+	let proportional_msat = u64::try_from(proportional_msat).unwrap_or(u64::MAX);
+	let over_provisioning_msat = proportional_msat.max(min_channel_over_provisioning_msat);
+	amt_to_forward_msat.saturating_add(over_provisioning_msat) / 1000
+}
+
+#[cfg(test)]
+mod jit_sizing_tests {
+	use super::jit_channel_amount_sats;
+
+	#[test]
+	fn proportional_sizing_is_unchanged_without_a_floor() {
+		// 110,000 sats forwarded, 10%: a 121,000-sat channel, as before.
+		assert_eq!(jit_channel_amount_sats(110_000_000, 100_000, 0), 121_000);
+		assert_eq!(jit_channel_amount_sats(1_000, 100_000, 0), 1);
+		assert_eq!(jit_channel_amount_sats(0, 100_000, 0), 0);
+	}
+
+	#[test]
+	fn the_floor_binds_when_it_exceeds_the_proportional_part() {
+		// 110,000 sats forwarded, 10% = 11,000 < the 20,000-sat floor: 130,000 sats.
+		assert_eq!(jit_channel_amount_sats(110_000_000, 100_000, 20_000_000), 130_000);
+		// 20,000 sats forwarded: 2,000 < 20,000, so 40,000 sats.
+		assert_eq!(jit_channel_amount_sats(20_000_000, 100_000, 20_000_000), 40_000);
+	}
+
+	#[test]
+	fn the_proportional_part_binds_when_it_exceeds_the_floor() {
+		// 200,000 sats forwarded, 10% = 20,000 = the floor: 220,000 either way.
+		assert_eq!(jit_channel_amount_sats(200_000_000, 100_000, 20_000_000), 220_000);
+		// 300,000 sats forwarded, 10% = 30,000 > the floor: 330,000.
+		assert_eq!(jit_channel_amount_sats(300_000_000, 100_000, 20_000_000), 330_000);
+	}
+
+	#[test]
+	fn sizing_never_wraps() {
+		assert_eq!(jit_channel_amount_sats(u64::MAX, 1_000_000, u64::MAX), u64::MAX / 1000);
+		assert_eq!(jit_channel_amount_sats(u64::MAX, 0, 0), u64::MAX / 1000);
+	}
+}
+
