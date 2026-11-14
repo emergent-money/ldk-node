@@ -1,6 +1,9 @@
 # Pending
 
 ## Compatibility Notes
+- `LSPS2ServiceConfig` gains `min_channel_over_provisioning_msat`: a floor, in millisatoshis, on the
+  capacity provisioned beyond the forwarded amount, so a JIT channel keeps at least that much inbound
+  capacity whatever the size of the payment that opened it. `0` keeps the previous proportional sizing.
 - Inbound BOLT11 payments now report amounts net of any withheld LSP fee as soon as they
   become claimable, consistently with completed payments and BOLT12. Pending invoices from
   v0.7 and earlier retain invoice-based amounts, minus any recorded fee, until another payment
