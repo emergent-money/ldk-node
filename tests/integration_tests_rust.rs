@@ -6279,6 +6279,7 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 		advertise_service: false,
 		channel_opening_fee_ppm: 10_000,
 		channel_over_provisioning_ppm: 100_000,
+		min_channel_over_provisioning_msat: 0,
 		max_payment_size_msat: 1_000_000_000,
 		min_payment_size_msat: 0,
 		min_channel_lifetime: 100,
@@ -6360,7 +6361,7 @@ async fn lsps2_service_prunes_closed_channel_state() {
 	let jit_amount_msat = 100_000_000;
 	let jit_invoice = client_node
 		.bolt11_payment()
-		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024)
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024, None)
 		.unwrap();
 
 	let payer_payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
@@ -6402,7 +6403,7 @@ async fn lsps2_service_fails_payment_if_it_cannot_open_channel() {
 	let jit_amount_msat = 100_000_000;
 	let jit_invoice = client_node
 		.bolt11_payment()
-		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024)
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024, None)
 		.unwrap();
 
 	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
@@ -6442,7 +6443,7 @@ async fn lsps2_service_fails_payment_if_client_is_disconnected() {
 	let jit_amount_msat = 100_000_000;
 	let jit_invoice = client_node
 		.bolt11_payment()
-		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024)
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024, None)
 		.unwrap();
 
 	client_node.stop().unwrap();
@@ -6489,7 +6490,7 @@ async fn lsps2_service_fails_payment_if_channel_closes_before_ready() {
 		Bolt11InvoiceDescription::Direct(Description::new(String::from("asdf")).unwrap());
 	let jit_invoice = client_node
 		.bolt11_payment()
-		.receive_via_jit_channel(100_000_000, &invoice_description.into(), 1024)
+		.receive_via_jit_channel(100_000_000, &invoice_description.into(), 1024, None)
 		.unwrap();
 
 	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
